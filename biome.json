@@ -37,7 +37,8 @@
 				"noEmptyBlockStatements": "error"
 			},
 			"style": {
-				"useTemplate": "off"
+				"useTemplate": "off",
+				"noParameterAssign": "off"
 			}
 		}
 	},

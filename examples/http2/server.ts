@@ -1,7 +1,7 @@
-import {createSecureServer} from "node:http2";
-import {resolve} from "node:path";
-import {promisify} from "node:util";
-import {createSession} from "better-sse";
+import { createSecureServer } from "node:http2";
+import { resolve } from "node:path";
+import { promisify } from "node:util";
+import { createSession } from "better-sse";
 import {
 	type CertificateCreationOptions,
 	type CertificateCreationResult,
@@ -17,17 +17,17 @@ import {
 	const indexHtmlPath = resolve(__dirname, "./public/index.html");
 	const indexJsPath = resolve(__dirname, "./public/index.js");
 
-	const {serviceKey: key, certificate: cert} = await createCertificate({
+	const { serviceKey: key, certificate: cert } = await createCertificate({
 		selfSigned: true,
 		days: 1,
 	});
 
-	const server = createSecureServer({key, cert}, async (req, res) => {
-		const {":path": path, ":method": method} = req.headers;
-		const {stream} = res;
+	const server = createSecureServer({ key, cert }, async (req, res) => {
+		const { ":path": path, ":method": method } = req.headers;
+		const { stream } = res;
 
 		if (method !== "GET") {
-			stream.respond({":status": 405});
+			stream.respond({ ":status": 405 });
 			stream.end();
 			return;
 		}
@@ -49,7 +49,7 @@ import {
 				break;
 			}
 			default: {
-				stream.respond({":status": 404});
+				stream.respond({ ":status": 404 });
 			}
 		}
 	});

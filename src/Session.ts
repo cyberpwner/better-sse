@@ -1,9 +1,7 @@
 import {
 	type IncomingMessage as Http1ServerRequest,
 	ServerResponse as Http1ServerResponse,
-	IncomingMessage,
 	type OutgoingHttpHeaders,
-	ServerResponse,
 } from "node:http";
 import type { Http2ServerRequest, Http2ServerResponse } from "node:http2";
 import { EventBuffer, type EventBufferOptions } from "./EventBuffer";
@@ -137,26 +135,71 @@ class Session<State = DefaultSessionState> extends TypedEmitter<SessionEvents> {
 	private encoder = new TextEncoder();
 	private serialize: SerializerFunction;
 	private sanitize: SanitizerFunction;
-	private trustClientEventId: boolean;
 	private initialRetry: number | null;
 	private keepAliveInterval: number | null;
 	private keepAliveTimer?: ReturnType<typeof setInterval>;
 
 	constructor(
-		req: Request,
-		resOrOptions?: Response | SessionOptions<State>,
+		req: Http1ServerRequest,
+		res: Http1ServerResponse,
+		options?: SessionOptions<State>
+	);
+	constructor(
+		req: Http2ServerRequest,
+		res: Http2ServerResponse,
+		options?: SessionOptions<State>
+	);
+	constructor(req: Request, res: Response, options?: SessionOptions<State>);
+	constructor(req: Request, options?: SessionOptions<State>);
+	constructor(
+		req: Http1ServerRequest | Http2ServerRequest | Request,
+		resOrOptions?:
+			| Http1ServerRequest
+			| Http2ServerResponse
+			| Response
+			| SessionOptions<State>,
 		options?: SessionOptions<State>
 	) {
 		super();
 
+		let givenReq: Request;
 		let givenRes: Response | undefined;
 		let givenOptions: SessionOptions<State>;
 
-		if (resOrOptions instanceof Response) {
-			givenRes = resOrOptions;
-			givenOptions = options ?? {};
+		if (req instanceof Request) {
+			givenReq = req;
+
+			if (resOrOptions instanceof Response) {
+				givenRes = resOrOptions;
+				givenOptions = options ?? {};
+			} else {
+				givenOptions = resOrOptions ?? {};
+			}
 		} else {
-			givenOptions = resOrOptions ?? {};
+			const controller = new AbortController();
+
+			req.once("close", controller.abort);
+			(resOrOptions as Http1ServerResponse | Http2ServerResponse).once(
+				"close",
+				controller.abort
+			);
+
+			controller.signal.addEventListener("abort", () => {
+				req.removeListener("close", controller.abort);
+				(
+					resOrOptions as Http1ServerResponse | Http2ServerResponse
+				).removeListener("close", controller.abort);
+			});
+
+			givenReq = new Request(req.url as string, {
+				method: req.method,
+				headers: req.headers as Record<string, string | string[]>,
+				signal: controller.signal,
+			});
+
+			givenRes = new Response();
+
+			givenOptions = options ?? {};
 		}
 
 		const serializer = givenOptions.serializer ?? serialize;
@@ -166,8 +209,6 @@ class Session<State = DefaultSessionState> extends TypedEmitter<SessionEvents> {
 		this.sanitize = sanitizer;
 
 		this.buffer = new EventBuffer({ serializer, sanitizer });
-
-		this.trustClientEventId = givenOptions.trustClientEventId ?? true;
 
 		this.initialRetry =
 			givenOptions.retry === null ? null : givenOptions.retry ?? 2000;
@@ -181,7 +222,7 @@ class Session<State = DefaultSessionState> extends TypedEmitter<SessionEvents> {
 
 		this.writer = writable.getWriter();
 
-		this.request = req;
+		this.request = givenReq;
 
 		this.url = new URL(this.request.url);
 
@@ -209,7 +250,7 @@ class Session<State = DefaultSessionState> extends TypedEmitter<SessionEvents> {
 			}
 		}
 
-		if (this.trustClientEventId) {
+		if (givenOptions.trustClientEventId) {
 			this.lastId =
 				this.request.headers.get("last-event-id") ??
 				this.url.searchParams.get("lastEventId") ??
