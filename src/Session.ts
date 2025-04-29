@@ -1,7 +1,7 @@
-import {
-	type IncomingMessage as Http1ServerRequest,
+import type {
+	IncomingMessage as Http1ServerRequest,
 	ServerResponse as Http1ServerResponse,
-	type OutgoingHttpHeaders,
+	OutgoingHttpHeaders,
 } from "node:http";
 import type { Http2ServerRequest, Http2ServerResponse } from "node:http2";
 import { EventBuffer, type EventBufferOptions } from "./EventBuffer";
@@ -130,6 +130,11 @@ class Session<State = DefaultSessionState> extends TypedEmitter<SessionEvents> {
 	private buffer: EventBuffer;
 	private request: Request;
 	private response: Response;
+	private res?:
+		| Http1ServerResponse
+		| (Http2ServerResponse & {
+				write: (chunk: string) => void;
+		  });
 	private url: URL;
 	private writer: WritableStreamDefaultWriter;
 	private encoder = new TextEncoder();
@@ -139,18 +144,6 @@ class Session<State = DefaultSessionState> extends TypedEmitter<SessionEvents> {
 	private keepAliveInterval: number | null;
 	private keepAliveTimer?: ReturnType<typeof setInterval>;
 
-	constructor(
-		req: Http1ServerRequest,
-		res: Http1ServerResponse,
-		options?: SessionOptions<State>
-	);
-	constructor(
-		req: Http2ServerRequest,
-		res: Http2ServerResponse,
-		options?: SessionOptions<State>
-	);
-	constructor(req: Request, res: Response, options?: SessionOptions<State>);
-	constructor(req: Request, options?: SessionOptions<State>);
 	constructor(
 		req: Http1ServerRequest | Http2ServerRequest | Request,
 		resOrOptions?:
@@ -176,6 +169,8 @@ class Session<State = DefaultSessionState> extends TypedEmitter<SessionEvents> {
 				givenOptions = resOrOptions ?? {};
 			}
 		} else {
+			this.res = resOrOptions as typeof this.res;
+
 			const controller = new AbortController();
 
 			req.once("close", controller.abort);
@@ -191,16 +186,24 @@ class Session<State = DefaultSessionState> extends TypedEmitter<SessionEvents> {
 				).removeListener("close", controller.abort);
 			});
 
-			givenReq = new Request(req.url as string, {
+			console.log("making req", req.headers.host, req.url);
+
+			const url = `http://${req.headers.host}${req.url}`;
+
+			givenReq = new Request(url, {
 				method: req.method,
 				headers: req.headers as Record<string, string | string[]>,
 				signal: controller.signal,
 			});
 
+			console.log("passed???");
+
 			givenRes = new Response();
 
 			givenOptions = options ?? {};
 		}
+
+		console.log("given url", givenReq.url);
 
 		const serializer = givenOptions.serializer ?? serialize;
 		const sanitizer = givenOptions.sanitizer ?? sanitize;
@@ -211,10 +214,12 @@ class Session<State = DefaultSessionState> extends TypedEmitter<SessionEvents> {
 		this.buffer = new EventBuffer({ serializer, sanitizer });
 
 		this.initialRetry =
-			givenOptions.retry === null ? null : givenOptions.retry ?? 2000;
+			givenOptions.retry === null ? null : (givenOptions.retry ?? 2000);
 
 		this.keepAliveInterval =
-			givenOptions.keepAlive === null ? null : givenOptions.keepAlive ?? 10000;
+			givenOptions.keepAlive === null
+				? null
+				: (givenOptions.keepAlive ?? 10000);
 
 		this.state = givenOptions.state ?? ({} as State);
 
@@ -238,6 +243,26 @@ class Session<State = DefaultSessionState> extends TypedEmitter<SessionEvents> {
 			},
 		});
 
+		const reader = readable.getReader();
+
+		async function pump() {
+			return reader.read().then(({ done, value }) => {
+				console.log({ done, value });
+
+				if (done) {
+					return;
+				}
+
+				if (value) {
+					(resOrOptions as Http1ServerResponse).write(value);
+				}
+
+				pump();
+			});
+		}
+
+		pump();
+
 		if (givenRes) {
 			for (const [key, value] of givenRes.headers) {
 				this.response.headers.set(key, value);
@@ -258,10 +283,23 @@ class Session<State = DefaultSessionState> extends TypedEmitter<SessionEvents> {
 				"";
 		}
 
+		console.log("about to signal");
+
 		this.request.signal.addEventListener("abort", this.onDisconnected);
+
+		setImmediate(this.initialize);
 	}
 
 	private initialize = async () => {
+		console.log("entered init");
+
+		if (this.res) {
+			this.res.writeHead(
+				this.response.status,
+				Object.fromEntries(this.response.headers)
+			);
+		}
+
 		if (this.url.searchParams.has("padding")) {
 			this.buffer.comment(" ".repeat(2049)).dispatch();
 		}
@@ -273,6 +311,8 @@ class Session<State = DefaultSessionState> extends TypedEmitter<SessionEvents> {
 		if (this.initialRetry !== null) {
 			this.buffer.retry(this.initialRetry).dispatch();
 		}
+
+		console.log("about to flush");
 
 		await this.flush();
 
@@ -286,6 +326,8 @@ class Session<State = DefaultSessionState> extends TypedEmitter<SessionEvents> {
 	};
 
 	private onDisconnected = async () => {
+		console.log("dc, removing abort");
+
 		this.request.signal.removeEventListener("abort", this.onDisconnected);
 
 		await this.writer.close();
@@ -307,7 +349,6 @@ class Session<State = DefaultSessionState> extends TypedEmitter<SessionEvents> {
 	getRequest = () => this.request;
 
 	getResponse = () => {
-		this.initialize();
 		return this.response;
 	};
 
@@ -373,13 +414,25 @@ class Session<State = DefaultSessionState> extends TypedEmitter<SessionEvents> {
 	 * @deprecated see https://github.com/MatthewWid/better-sse/issues/52
 	 */
 	flush = async () => {
-		const encoded = this.encoder.encode(this.buffer.read());
+		const contents = this.buffer.read();
+
+		console.log(`About to encode: ${contents}`);
+
+		const encoded = this.encoder.encode(contents);
+
+		console.log(`Encoded: ${encoded}`);
 
 		this.buffer.clear();
 
+		console.log("About to write");
+
 		await this.writer.ready;
 
+		console.log("Writer is ready");
+
 		await this.writer.write(encoded);
+
+		console.log("Writer has written");
 	};
 
 	/**

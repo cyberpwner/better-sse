@@ -38,7 +38,8 @@
 			},
 			"style": {
 				"useTemplate": "off",
-				"noParameterAssign": "off"
+				"noParameterAssign": "off",
+				"useShorthandFunctionType": "off"
 			}
 		}
 	},
