@@ -9,9 +9,18 @@ import { type EventMap, TypedEmitter } from "./lib/TypedEmitter";
 import { createPushFromIterable } from "./lib/createPushFromIterable";
 import { createPushFromStream } from "./lib/createPushFromStream";
 import { generateId } from "./lib/generateId";
-import { type SanitizerFunction, sanitize } from "./lib/sanitize";
-import { type SerializerFunction, serialize } from "./lib/serialize";
-import { DEFAULT_RESPONSE_HEADERS } from "./lib/constants";
+import {
+	type SanitizerFunction,
+	sanitize as defaultSanitizer,
+} from "./lib/sanitize";
+import {
+	type SerializerFunction,
+	serialize as defaultSerializer,
+} from "./lib/serialize";
+import {
+	DEFAULT_RESPONSE_CODE,
+	DEFAULT_RESPONSE_HEADERS,
+} from "./lib/constants";
 
 type NodeRequest = Http1ServerRequest | Http2ServerRequest;
 
@@ -133,7 +142,7 @@ class Session<State = DefaultSessionState> extends TypedEmitter<SessionEvents> {
 	 * Use [module augmentation and declaration merging](https://www.typescriptlang.org/docs/handbook/declaration-merging.html#module-augmentation)
 	 * to safely add new properties to the `DefaultSessionState` interface.
 	 */
-	state: State;
+	state = {} as State;
 
 	private buffer: EventBuffer;
 	private request: Request;
@@ -151,7 +160,7 @@ class Session<State = DefaultSessionState> extends TypedEmitter<SessionEvents> {
 	constructor(
 		req: Http1ServerRequest | Http2ServerRequest | Request,
 		res?: Http1ServerRequest | Http2ServerResponse | Response,
-		options?: SessionOptions<State>
+		options: SessionOptions<State> = {}
 	) {
 		super();
 
@@ -163,11 +172,14 @@ class Session<State = DefaultSessionState> extends TypedEmitter<SessionEvents> {
 			this.request = req;
 
 			this.response = new Response(readable, {
-				status: options?.statusCode ?? (res as Response).status ?? 200,
+				status:
+					options.statusCode ??
+					(res as Response | undefined)?.status ??
+					DEFAULT_RESPONSE_CODE,
 				headers: {
 					...DEFAULT_RESPONSE_HEADERS,
-					...Object.fromEntries((res as Response).headers),
-					...options?.headers,
+					...(res ? Object.fromEntries((res as Response).headers) : {}),
+					...options.headers,
 				},
 			});
 		} else {
@@ -197,9 +209,43 @@ class Session<State = DefaultSessionState> extends TypedEmitter<SessionEvents> {
 				headers: req.headers as Record<string, string | string[]>,
 				signal: controller.signal,
 			});
+
+			this.response = new Response(readable, {
+				status: options.statusCode ?? res.statusCode ?? DEFAULT_RESPONSE_CODE,
+				headers: {
+					...DEFAULT_RESPONSE_HEADERS,
+					...(res.getHeaders() as Record<string, string | string[]>),
+					...options.headers,
+				},
+			});
 		}
 
 		this.url = new URL(this.request.url);
+
+		if (options.trustClientEventId) {
+			this.lastId =
+				this.request.headers.get("last-event-id") ??
+				this.url.searchParams.get("lastEventId") ??
+				this.url.searchParams.get("evs_last_event_id") ??
+				"";
+		}
+
+		if (options.state) {
+			this.state = options.state;
+		}
+
+		this.initialRetry = options.retry === null ? null : (options.retry ?? 2000);
+
+		this.keepAliveInterval =
+			options.keepAlive === null ? null : (options.keepAlive ?? 10000);
+
+		this.serialize = options.serializer ?? defaultSerializer;
+		this.sanitize = options.sanitizer ?? defaultSanitizer;
+
+		this.buffer = new EventBuffer({
+			serializer: this.serialize,
+			sanitizer: this.sanitize,
+		});
 
 		this.request.signal.addEventListener("abort", this.onDisconnected);
 
@@ -370,7 +416,9 @@ class Session<State = DefaultSessionState> extends TypedEmitter<SessionEvents> {
 		eventId = generateId()
 	): Promise<void> => {
 		if (!this.isConnected) {
-			throw new SseError("Cannot push data to a non-active session.");
+			throw new SseError(
+				"Cannot push data to a non-active session. Ensure the session is connected before attempting to push events."
+			);
 		}
 
 		this.buffer.push(data, eventName, eventId);
