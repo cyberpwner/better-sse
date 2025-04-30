@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## Unreleased
 
+### Changed
+
+* Update type of `Session` constructor `options#headers` argument to accept any `string->(string | string[])` type rather than only `OutgoingHttpHeaders`.
+
 ## 0.14.1 - 2024-10-27
 
 ### Changed

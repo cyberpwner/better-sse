@@ -1,9 +1,8 @@
-import type {
-	IncomingMessage as Http1ServerRequest,
+import {
+	type IncomingMessage as Http1ServerRequest,
 	ServerResponse as Http1ServerResponse,
-	OutgoingHttpHeaders,
 } from "node:http";
-import type { Http2ServerRequest, Http2ServerResponse } from "node:http2";
+import { type Http2ServerRequest, Http2ServerResponse } from "node:http2";
 import { EventBuffer, type EventBufferOptions } from "./EventBuffer";
 import { SseError } from "./lib/SseError";
 import { type EventMap, TypedEmitter } from "./lib/TypedEmitter";
@@ -12,6 +11,15 @@ import { createPushFromStream } from "./lib/createPushFromStream";
 import { generateId } from "./lib/generateId";
 import { type SanitizerFunction, sanitize } from "./lib/sanitize";
 import { type SerializerFunction, serialize } from "./lib/serialize";
+import { DEFAULT_RESPONSE_HEADERS } from "./lib/constants";
+
+type NodeRequest = Http1ServerRequest | Http2ServerRequest;
+
+type NodeResponse =
+	| Http1ServerResponse
+	| (Http2ServerResponse & {
+			write: (chunk: string) => void;
+	  });
 
 interface SessionOptions<State = DefaultSessionState>
 	extends Pick<EventBufferOptions, "serializer" | "sanitizer"> {
@@ -63,7 +71,7 @@ interface SessionOptions<State = DefaultSessionState>
 	/**
 	 * Additional headers to be sent along with the response.
 	 */
-	headers?: OutgoingHttpHeaders;
+	headers?: Record<string, string | string[]>;
 
 	/**
 	 * Custom state for this session.
@@ -130,11 +138,7 @@ class Session<State = DefaultSessionState> extends TypedEmitter<SessionEvents> {
 	private buffer: EventBuffer;
 	private request: Request;
 	private response: Response;
-	private res?:
-		| Http1ServerResponse
-		| (Http2ServerResponse & {
-				write: (chunk: string) => void;
-		  });
+	private res?: NodeResponse;
 	private url: URL;
 	private writer: WritableStreamDefaultWriter;
 	private encoder = new TextEncoder();
@@ -146,144 +150,56 @@ class Session<State = DefaultSessionState> extends TypedEmitter<SessionEvents> {
 
 	constructor(
 		req: Http1ServerRequest | Http2ServerRequest | Request,
-		resOrOptions?:
-			| Http1ServerRequest
-			| Http2ServerResponse
-			| Response
-			| SessionOptions<State>,
+		res?: Http1ServerRequest | Http2ServerResponse | Response,
 		options?: SessionOptions<State>
 	) {
 		super();
-
-		let givenReq: Request;
-		let givenRes: Response | undefined;
-		let givenOptions: SessionOptions<State>;
-
-		if (req instanceof Request) {
-			givenReq = req;
-
-			if (resOrOptions instanceof Response) {
-				givenRes = resOrOptions;
-				givenOptions = options ?? {};
-			} else {
-				givenOptions = resOrOptions ?? {};
-			}
-		} else {
-			this.res = resOrOptions as typeof this.res;
-
-			const controller = new AbortController();
-
-			req.once("close", controller.abort);
-			(resOrOptions as Http1ServerResponse | Http2ServerResponse).once(
-				"close",
-				controller.abort
-			);
-
-			controller.signal.addEventListener("abort", () => {
-				req.removeListener("close", controller.abort);
-				(
-					resOrOptions as Http1ServerResponse | Http2ServerResponse
-				).removeListener("close", controller.abort);
-			});
-
-			console.log("making req", req.headers.host, req.url);
-
-			const url = `http://${req.headers.host}${req.url}`;
-
-			givenReq = new Request(url, {
-				method: req.method,
-				headers: req.headers as Record<string, string | string[]>,
-				signal: controller.signal,
-			});
-
-			console.log("passed???");
-
-			givenRes = new Response();
-
-			givenOptions = options ?? {};
-		}
-
-		console.log("given url", givenReq.url);
-
-		const serializer = givenOptions.serializer ?? serialize;
-		const sanitizer = givenOptions.sanitizer ?? sanitize;
-
-		this.serialize = serializer;
-		this.sanitize = sanitizer;
-
-		this.buffer = new EventBuffer({ serializer, sanitizer });
-
-		this.initialRetry =
-			givenOptions.retry === null ? null : (givenOptions.retry ?? 2000);
-
-		this.keepAliveInterval =
-			givenOptions.keepAlive === null
-				? null
-				: (givenOptions.keepAlive ?? 10000);
-
-		this.state = givenOptions.state ?? ({} as State);
 
 		const { readable, writable } = new TransformStream();
 
 		this.writer = writable.getWriter();
 
-		this.request = givenReq;
+		if (req instanceof Request) {
+			this.request = req;
 
-		this.url = new URL(this.request.url);
+			this.response = new Response(readable, {
+				status: options?.statusCode ?? (res as Response).status ?? 200,
+				headers: {
+					...DEFAULT_RESPONSE_HEADERS,
+					...Object.fromEntries((res as Response).headers),
+					...options?.headers,
+				},
+			});
+		} else {
+			if (
+				!(
+					res instanceof Http1ServerResponse ||
+					res instanceof Http2ServerResponse
+				)
+			) {
+				throw new SseError(
+					"When providing a Node IncomingMessage or Http2ServerRequest object, a corresponding ServerResponse or Http2ServerResponse object must also be provided."
+				);
+			}
 
-		this.response = new Response(readable, {
-			status: givenOptions.statusCode ?? givenRes?.status ?? 200,
-			headers: {
-				"Content-Type": "text/event-stream",
-				"Cache-Control":
-					"private, no-cache, no-store, no-transform, must-revalidate, max-age=0",
-				Connection: "keep-alive",
-				Pragma: "no-cache",
-				"X-Accel-Buffering": "no",
-			},
-		});
+			this.res = res;
 
-		const reader = readable.getReader();
+			const controller = new AbortController();
 
-		async function pump() {
-			return reader.read().then(({ done, value }) => {
-				console.log({ done, value });
+			req.once("close", controller.abort);
+			res.once("close", controller.abort);
 
-				if (done) {
-					return;
-				}
+			const url = `http://${req.headers.host}${req.url}`;
 
-				if (value) {
-					(resOrOptions as Http1ServerResponse).write(value);
-				}
-
-				pump();
+			this.request = new Request(url, {
+				duplex: "half",
+				method: req.method,
+				headers: req.headers as Record<string, string | string[]>,
+				signal: controller.signal,
 			});
 		}
 
-		pump();
-
-		if (givenRes) {
-			for (const [key, value] of givenRes.headers) {
-				this.response.headers.set(key, value);
-			}
-		}
-
-		if (givenOptions.headers) {
-			for (const [key, value] of Object.entries(givenOptions.headers)) {
-				this.response.headers.set(key, (value as string) ?? "");
-			}
-		}
-
-		if (givenOptions.trustClientEventId) {
-			this.lastId =
-				this.request.headers.get("last-event-id") ??
-				this.url.searchParams.get("lastEventId") ??
-				this.url.searchParams.get("evs_last_event_id") ??
-				"";
-		}
-
-		console.log("about to signal");
+		this.url = new URL(this.request.url);
 
 		this.request.signal.addEventListener("abort", this.onDisconnected);
 
